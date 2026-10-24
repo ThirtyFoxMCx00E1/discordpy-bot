@@ -121,21 +121,33 @@ async def stats_cmd(inter: discord.Interaction):
     await inter.response.send_message(embed=e, ephemeral=True)
 
 
+async def _sync_guild(g):
+    try:
+        tree.copy_global_to(guild=g)
+        cmds = await tree.sync(guild=g)
+        log.info("Slash commands in %s: %s", g, ", ".join("/" + c.name for c in cmds))
+    except discord.Forbidden:
+        log.warning("No slash commands in %s: re-invite the bot WITH the applications.commands scope (link above)", g)
+    except Exception as e:
+        log.warning("sync %s: %s", g, e)
+
+
 @client.event
 async def on_ready():
-    log.info("Logged in as %s", client.user)
+    log.info("Logged in as %s, in %d server(s)", client.user, len(client.guilds))
+    log.info("Invite link (bot + slash commands): https://discord.com/oauth2/authorize?client_id=%s&scope=bot+applications.commands&permissions=277025392640", client.user.id)
     for g in client.guilds:   # guild sync: the commands show up at once
-        try:
-            tree.copy_global_to(guild=g)
-            await tree.sync(guild=g)
-        except Exception as e:
-            log.warning("sync %s: %s", g, e)
+        await _sync_guild(g)
+    try:
+        await tree.sync()     # global too (other servers, up to 1 h)
+    except Exception as e:
+        log.warning("global sync: %s", e)
 
 
 @client.event
 async def on_guild_join(g):
-    tree.copy_global_to(guild=g)
-    await tree.sync(guild=g)
+    log.info("Joined %s", g)
+    await _sync_guild(g)
 
 
 if __name__ == "__main__":
