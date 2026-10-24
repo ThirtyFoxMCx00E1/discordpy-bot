@@ -28,7 +28,13 @@ Railway that lives on our HiveMQ server (or on a Termux phone). It clones this r
 `requirements.txt`, starts `Procfile` (`worker: python main.py`), restarts on crash and on reboot,
 and **deploys every new commit on `main` by itself within 2 minutes**.
 
-On the HiveMQ server (once):
+**Automatic (no command on the server):** add the repository secrets `DISCORD_TOKEN` and
+`SSH_PASSWORD` (or `SSH_KEY`) in Settings > Secrets and variables > Actions (`AUTH_PRIVATE_KEY` is
+already there). The **Deploy to MP Railway** workflow then logs in to the server
+(`mpsamp.duckdns.org`, user `root`; change with the `SSH_HOST` / `SSH_USER` variables) and installs /
+updates the bot on every push. Run it any time: Actions > Deploy to MP Railway > Run workflow.
+
+Or by hand on the HiveMQ server (once):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/railway/install.sh | sudo bash
