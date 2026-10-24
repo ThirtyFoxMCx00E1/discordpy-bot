@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # accounts.db lives here; mount a volume so it survives redeploys
-ENV DATA_DIR=/data
+ENV DATA_DIR=/data PYTHONUNBUFFERED=1
 VOLUME /data
 
 CMD ["python", "main.py"]

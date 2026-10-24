@@ -113,6 +113,18 @@ class AuthCore:
         r, s = decode_dss_signature(der)
         return payload, (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
 
+    def sign_status(self, text):
+        """3.21.7: signs the MP Railway status beacon. Own prefix, so it can never pass as a login ticket
+        (the game server only accepts payloads that start with "WAGU1|")."""
+        payload = "WAGUSTATUS1|" + text
+        der = self.key.sign(payload.encode(), ec.ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(der)
+        return (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
+
+    def account_count(self):
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+
     # ---------------------------------------------------------------- housekeeping
     def _expire(self):
         t = _now()

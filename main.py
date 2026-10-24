@@ -1,19 +1,27 @@
-"""MP Multiplayer Discord bot (Railway, 24/7).
+"""MP Multiplayer Discord bot (3.21.7, runs 24/7 on MP Railway - our own self-hosted Railway).
 
   /gen CODE  - only in #verification: links the code shown in the game to your Discord account
-  /stats     - your game account (only you see the answer)
+  /stats     - your game account card (only you see it)
+  /char      - the same card, character style (only you see it)
 
-Railway variables (Settings -> Variables), never put them in the code:
+Settings are environment variables, never put them in the code or in git:
   DISCORD_TOKEN     the bot token (Discord Developer Portal -> Bot -> Reset Token)
   AUTH_PRIVATE_KEY  the login system key (64 hex characters, matches the public key in the mod)
-  DATA_DIR          optional, default /data (add a Railway Volume mounted at /data so accounts survive redeploys)
+  DATA_DIR          optional, default /data (Docker) or ./data; accounts.db lives here
   VERIFY_CHANNEL    optional, default "verification"
+  MP_RAILWAY_APP    set by MP Railway: app name (status beacon topic)
+  MP_RAILWAY_COMMIT set by MP Railway: deployed git commit
+  MP_RAILWAY_HOST   optional: name shown on the website's Railway page (default "MP Railway")
+
+On MP Railway:   sudo mp-railway setup        (asks for the two keys, deploys, starts, 24/7)
 """
 import asyncio
 import datetime
+import json
 import logging
 import os
-import threading
+import platform
+import time
 
 import discord
 from discord import app_commands
@@ -21,16 +29,23 @@ import paho.mqtt.client as mqtt
 
 from authcore import AuthCore, TOPIC_REQ, TOPIC_RES
 
+VERSION = "3.21.7"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mpbot")
 
 VERIFY_CHANNEL = os.environ.get("VERIFY_CHANNEL", "verification").lstrip("#").lower()
 DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 BROKERS = [("broker.hivemq.com", 1883), ("test.mosquitto.org", 1883), ("broker.emqx.io", 1883)]
+APP = os.environ.get("MP_RAILWAY_APP", "discordpy-bot")
+COMMIT = (os.environ.get("MP_RAILWAY_COMMIT") or os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "")[:7]
+HOST_LABEL = os.environ.get("MP_RAILWAY_HOST", "MP Railway")
+STATUS_TOPIC = f"wagu/railway/{APP}/status"     # retained; the website's Railway page reads it
+SITE = "https://thirtyfoxmcx00e1.github.io/wagu/"
+STARTED = int(time.time())
 
 core = AuthCore(os.environ.get("AUTH_PRIVATE_KEY", ""), os.path.join(DATA_DIR, "accounts.db"))
 if not core.ready:
-    log.warning("AUTH_PRIVATE_KEY is not set: /gen and game logins are off until you add it in Railway")
+    log.warning("AUTH_PRIVATE_KEY is not set: /gen and game logins are off until you add it (sudo mp-railway env set AUTH_PRIVATE_KEY)")
 else:
     log.info("login system ready, public key %s...", core.public_hex()[:16])
 
@@ -41,12 +56,14 @@ class Bridge:
         self.clients = []
 
     def start(self):
+        offline = json.dumps({"app": APP, "online": False, "ver": VERSION})
         for i, (host, port) in enumerate(BROKERS):
             c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"mpbot-{os.getpid()}-{i}", clean_session=True)
             c.user_data_set(i)
             c.on_connect = self.on_connect
             c.on_message = self.on_message
             c.reconnect_delay_set(1, 30)
+            c.will_set(STATUS_TOPIC, offline, qos=1, retain=True)   # broker marks us offline if we vanish
             try:
                 c.connect_async(host, port, keepalive=30)
                 c.loop_start()
@@ -73,6 +90,26 @@ class Bridge:
         for c in self.clients:
             c.publish(TOPIC_RES + sid, frame, qos=0)
 
+    def connected(self):
+        return sum(1 for c in self.clients if c.is_connected())
+
+    def publish_status(self, doc):
+        text = json.dumps(doc, separators=(",", ":"))
+        if core.ready:   # signed: the website checks it with the mod's public key (nobody can fake "online")
+            text = json.dumps({"s": text, "sig": core.sign_status(text)}, separators=(",", ":"))
+        for c in self.clients:
+            if c.is_connected():
+                c.publish(STATUS_TOPIC, text, qos=1, retain=True)
+
+    def stop(self):
+        offline = json.dumps({"app": APP, "online": False, "ver": VERSION, "ts": int(time.time())})
+        for c in self.clients:
+            try:
+                c.publish(STATUS_TOPIC, offline, qos=1, retain=True).wait_for_publish(2)
+                c.disconnect()
+            except Exception:
+                pass
+
 
 bridge = Bridge()
 
@@ -81,6 +118,7 @@ bridge = Bridge()
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+synced = {"cmds": [], "guilds": 0, "at": 0}
 
 
 def in_verify_channel(inter: discord.Interaction) -> bool:
@@ -95,37 +133,105 @@ async def gen_cmd(inter: discord.Interaction, code: str):
     if not in_verify_channel(inter):
         await inter.response.send_message(f"Use /gen in the #{VERIFY_CHANNEL} channel.", ephemeral=True)
         return
+    if not core.ready:
+        await inter.response.send_message("The login system is starting up (no key yet). Try again in a minute.", ephemeral=True)
+        return
     text, pushes = await asyncio.to_thread(core.gen, inter.user.id, str(inter.user), code)
     for sid, frame in pushes:
         bridge.push(sid, frame)
     await inter.response.send_message(text, ephemeral=True)   # only you see it: the code stays private
 
 
-def _date(t):
-    return datetime.datetime.utcfromtimestamp(int(t)).strftime("%Y-%m-%d %H:%M UTC") if t else "-"
+def _ts(t):
+    return f"<t:{int(t)}:f>" if t else "-"
+
+
+def _ago(t):
+    return f"<t:{int(t)}:R>" if t else "never"
+
+
+def account_card(user: discord.abc.User, a: dict, style: str) -> discord.Embed:
+    """The account UI: one card, two looks (/stats = account, /char = character)."""
+    if style == "char":
+        e = discord.Embed(title=a["user"], description=f"**MP Multiplayer character**\nLinked to {user.mention}", color=0x111111)
+        e.add_field(name="Gender", value=a["gender"])
+        e.add_field(name="Age", value=str(a["age"]))
+        e.add_field(name="Logins", value=str(a["logins"]))
+        e.add_field(name="Last seen", value=_ago(a["last_login"]) + (f"\non **{a['last_server']}**" if a["last_server"] else ""), inline=False)
+        e.add_field(name="Since", value=_ts(a["created"]), inline=False)
+    else:
+        e = discord.Embed(title=f"MP account: {a['user']}", description="Your MP Multiplayer login (only you see this).", color=0xD7263D)
+        e.add_field(name="User", value=a["user"])
+        e.add_field(name="Discord", value=a["discord_name"])
+        e.add_field(name="Gender", value=a["gender"])
+        e.add_field(name="Age", value=str(a["age"]))
+        e.add_field(name="Logins", value=str(a["logins"]))
+        e.add_field(name="Created", value=_ts(a["created"]))
+        e.add_field(name="Last login", value=_ts(a["last_login"]) + (f"\n{a['last_server']}" if a["last_server"] else ""), inline=False)
+    e.set_thumbnail(url=user.display_avatar.url)
+    e.set_footer(text=f"MP bot {VERSION} · MP Railway")
+    return e
+
+
+class CardView(discord.ui.View):
+    def __init__(self, owner_id: int, style: str):
+        super().__init__(timeout=600)
+        self.owner_id, self.style = owner_id, style
+        self.add_item(discord.ui.Button(label="Website", url=SITE, style=discord.ButtonStyle.link))
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, inter: discord.Interaction, button: discord.ui.Button):
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message("Use /stats yourself to see your own account.", ephemeral=True)
+            return
+        a = await asyncio.to_thread(core.account_by_discord, inter.user.id)
+        if not a:
+            await inter.response.edit_message(content="No game account any more.", embed=None, view=None)
+            return
+        await inter.response.edit_message(embed=account_card(inter.user, a, self.style), view=self)
+
+    @discord.ui.button(label="Switch view", style=discord.ButtonStyle.primary)
+    async def switch(self, inter: discord.Interaction, button: discord.ui.Button):
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message("Use /stats yourself to see your own account.", ephemeral=True)
+            return
+        self.style = "stats" if self.style == "char" else "char"
+        a = await asyncio.to_thread(core.account_by_discord, inter.user.id)
+        if not a:
+            await inter.response.edit_message(content="No game account any more.", embed=None, view=None)
+            return
+        await inter.response.edit_message(embed=account_card(inter.user, a, self.style), view=self)
+
+
+async def show_card(inter: discord.Interaction, style: str):
+    a = await asyncio.to_thread(core.account_by_discord, inter.user.id)
+    if not a:
+        e = discord.Embed(title="No MP account yet",
+                          description=f"1. Join a server in MP Multiplayer: a code appears.\n2. Type `/gen CODE` in #{VERIFY_CHANNEL}.\n3. Sign up in the game.",
+                          color=0x555555)
+        e.set_footer(text=f"MP bot {VERSION} · MP Railway")
+        await inter.response.send_message(embed=e, ephemeral=True)
+        return
+    await inter.response.send_message(embed=account_card(inter.user, a, style), view=CardView(inter.user.id, style), ephemeral=True)
 
 
 @tree.command(name="stats", description="Your MP Multiplayer account (only you see it)")
 async def stats_cmd(inter: discord.Interaction):
-    a = await asyncio.to_thread(core.account_by_discord, inter.user.id)
-    if not a:
-        await inter.response.send_message(f"No game account yet. Join a server, then use /gen in #{VERIFY_CHANNEL}.", ephemeral=True)
-        return
-    e = discord.Embed(title=f"MP account: {a['user']}", color=0xD7263D)
-    e.add_field(name="Discord", value=a["discord_name"])
-    e.add_field(name="Gender", value=a["gender"])
-    e.add_field(name="Age", value=str(a["age"]))
-    e.add_field(name="Created", value=_date(a["created"]))
-    e.add_field(name="Logins", value=str(a["logins"]))
-    e.add_field(name="Last login", value=_date(a["last_login"]) + (f"\n{a['last_server']}" if a["last_server"] else ""))
-    await inter.response.send_message(embed=e, ephemeral=True)
+    await show_card(inter, "stats")
+
+
+@tree.command(name="char", description="Your MP Multiplayer character card (only you see it)")
+async def char_cmd(inter: discord.Interaction):
+    await show_card(inter, "char")
 
 
 async def _sync_guild(g):
     try:
         tree.copy_global_to(guild=g)
         cmds = await tree.sync(guild=g)
-        log.info("Slash commands in %s: %s", g, ", ".join("/" + c.name for c in cmds))
+        names = ["/" + c.name for c in cmds]
+        synced["cmds"] = names
+        log.info("Slash commands in %s: %s", g, ", ".join(names))
     except discord.Forbidden:
         log.warning("No slash commands in %s: re-invite the bot WITH the applications.commands scope (link above)", g)
     except Exception as e:
@@ -134,14 +240,23 @@ async def _sync_guild(g):
 
 @client.event
 async def on_ready():
-    log.info("Logged in as %s, in %d server(s)", client.user, len(client.guilds))
+    log.info("Logged in as %s, in %d server(s) - MP bot %s %s", client.user, len(client.guilds), VERSION, COMMIT)
     log.info("Invite link (bot + slash commands): https://discord.com/oauth2/authorize?client_id=%s&scope=bot+applications.commands&permissions=277025392640", client.user.id)
     for g in client.guilds:   # guild sync: the commands show up at once
         await _sync_guild(g)
+    synced["guilds"], synced["at"] = len(client.guilds), int(time.time())
     try:
-        await tree.sync()     # global too (other servers, up to 1 h)
+        if os.environ.get("GLOBAL_SYNC", "0") == "1":
+            await tree.sync()   # global copy too (each command then shows twice in these servers)
+        elif await tree.fetch_commands():
+            # 3.21.6 also synced globally, so every command showed twice: drop the global copies
+            # (the per-server copies above stay; the tree itself is not touched)
+            await client.http.bulk_upsert_global_commands(client.application_id, [])
+            log.info("removed the old global command copies (no more double /gen)")
     except Exception as e:
-        log.warning("global sync: %s", e)
+        log.warning("global commands: %s", e)
+    if not getattr(client, "_beacon", None):
+        client._beacon = asyncio.create_task(beacon())
 
 
 @client.event
@@ -150,6 +265,30 @@ async def on_guild_join(g):
     await _sync_guild(g)
 
 
+async def beacon():
+    """Every 30 s: a signed, retained status message for the website (MP Railway page)."""
+    while True:
+        try:
+            doc = {
+                "app": APP, "online": client.is_ready(), "ver": VERSION, "commit": COMMIT, "host": HOST_LABEL,
+                "bot": str(client.user) if client.user else "", "guilds": len(client.guilds),
+                "cmds": synced["cmds"] or ["/gen", "/stats", "/char"], "login": core.ready,
+                "accounts": await asyncio.to_thread(core.account_count), "brokers": bridge.connected(),
+                "ping": round(client.latency * 1000) if client.latency == client.latency else -1,
+                "started": STARTED, "ts": int(time.time()), "py": platform.python_version(),
+            }
+            bridge.publish_status(doc)
+        except Exception as e:
+            log.warning("status beacon: %s", e)
+        await asyncio.sleep(30)
+
+
 if __name__ == "__main__":
+    token = os.environ.get("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("DISCORD_TOKEN is not set (on MP Railway: sudo mp-railway env set DISCORD_TOKEN)")
     bridge.start()
-    client.run(os.environ["DISCORD_TOKEN"], log_handler=None)
+    try:
+        client.run(token, log_handler=None)
+    finally:
+        bridge.stop()
