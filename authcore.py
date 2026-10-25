@@ -30,6 +30,8 @@ CODE_LEN = 8
 CODE_TTL = 10 * 60          # a /gen code works for 10 minutes
 VERIFY_TTL = 20 * 60        # after /gen: 20 minutes to fill in the sign up form
 SESSION_TTL = 12 * 3600     # logged in: new tickets (reconnect / host change) without the password
+DEVICE_TTL = 24 * 3600      # 3.21.8: a /gen is remembered for the phone 24 h (game restart -> Create your account)
+DEV_RE = re.compile(r"^[0-9a-f]{32}$")
 PBKDF2_ROUNDS = 200_000
 USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 GENDERS = ("Male", "Female", "Other")
@@ -73,6 +75,8 @@ class AuthCore:
             gender TEXT NOT NULL, age INTEGER NOT NULL,
             created INTEGER NOT NULL, last_login INTEGER NOT NULL DEFAULT 0, logins INTEGER NOT NULL DEFAULT 0,
             last_server TEXT NOT NULL DEFAULT '')""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS pending(
+            dev TEXT PRIMARY KEY, discord_id TEXT NOT NULL, discord_name TEXT NOT NULL, expires INTEGER NOT NULL)""")
         self.db.commit()
         self.sessions = {}      # sid -> {key, broker, seen, code, vtoken, vdiscord, vname, vexp}
         self.codes = {}         # code -> (sid, expires)
@@ -208,15 +212,54 @@ class AuthCore:
                     s["vpush"] = None
         return out
 
+    # ---------------------------------------------------------------- 3.21.8: verified phones
+    @staticmethod
+    def _dev_key(dev):
+        return hashlib.sha256(b"wagu-dev1|" + dev.encode()).hexdigest()
+
+    def _remember_dev(self, s):
+        if s.get("dev") and s.get("vdiscord"):
+            self.db.execute("INSERT OR REPLACE INTO pending(dev,discord_id,discord_name,expires) VALUES(?,?,?,?)",
+                            (self._dev_key(s["dev"]), s["vdiscord"], s["vname"], _now() + DEVICE_TTL))
+            self.db.commit()
+
+    def _forget_dev(self, s=None, discord_id=None):
+        if s is not None and s.get("dev"):
+            self.db.execute("DELETE FROM pending WHERE dev=?", (self._dev_key(s["dev"]),))
+        if discord_id:
+            self.db.execute("DELETE FROM pending WHERE discord_id=?", (str(discord_id),))
+        self.db.execute("DELETE FROM pending WHERE expires<?", (_now(),))
+        self.db.commit()
+
+    def _restore_dev(self, s):
+        """A phone that did /gen and then restarted the game (new key = new session): verified again."""
+        if not s.get("dev") or s.get("vtoken"):
+            return None
+        row = self.db.execute("SELECT discord_id,discord_name,expires FROM pending WHERE dev=?", (self._dev_key(s["dev"]),)).fetchone()
+        if not row or row[2] < _now():
+            return None
+        a = self._account("discord_id", row[0])
+        s["vtoken"] = secrets.token_hex(16)
+        s["vdiscord"], s["vname"] = row[0], row[1]
+        s["vexp"] = _now() + VERIFY_TTL
+        push = {"op": "verified", "vtoken": s["vtoken"], "dname": row[1], "has": 1 if a else 0, "user": a["user"] if a else ""}
+        s["vpush"], s["vpush_until"] = push, _now() + 10 * 60
+        if a:
+            self._forget_dev(s)                      # has an account already: just the Login screen once
+        return dict(push)
+
     def _handle(self, s, q):
         op = q.get("op")
         sid = s["sid"]
+        dev = q.get("dev", "")
+        if DEV_RE.match(dev):
+            s["dev"] = dev
         if op not in ("hello", "gen", "stats"):
             s["vpush"] = None                            # the phone moved on (sign up / login): stop re-sending
         if op in ("hello", "gen"):
-            p = self._pending_verified(s)
+            p = self._pending_verified(s) or self._restore_dev(s)
             if p:
-                return p                                 # back from Discord: tell it right away
+                return p                                 # back from Discord (or game restarted): tell it right away
         if op == "hello":
             return {"ok": 1}
         if op == "gen":
@@ -255,6 +298,7 @@ class AuthCore:
                             (user, user.lower(), s["vdiscord"], s["vname"], self._hash(pw, salt, PBKDF2_ROUNDS), salt, PBKDF2_ROUNDS, gender, int(age), _now()))
             self.db.commit()
             s["vtoken"] = None
+            self._forget_dev(s, s["vdiscord"])
             a = self._account("user_lc", user.lower())
             return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid)
         if op == "login":
@@ -304,6 +348,8 @@ class AuthCore:
             a = self._account("discord_id", str(discord_id))
             push = {"op": "verified", "vtoken": s["vtoken"], "dname": s["vname"], "has": 1 if a else 0, "user": a["user"] if a else ""}
             s["vpush"], s["vpush_until"] = push, _now() + 10 * 60
+            if not a:
+                self._remember_dev(s)
             if a:
                 text = f"Verified. You already have the game account **{a['user']}**: log in with it in the game."
             else:
