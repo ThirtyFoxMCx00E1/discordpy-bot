@@ -40,7 +40,6 @@ APP = os.environ.get("MP_RAILWAY_APP", "discordpy-bot")
 COMMIT = (os.environ.get("MP_RAILWAY_COMMIT") or os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "")[:7]
 HOST_LABEL = os.environ.get("MP_RAILWAY_HOST", "MP Railway")
 STATUS_TOPIC = f"wagu/railway/{APP}/status"     # retained; the website's Railway page reads it
-SITE = "https://thirtyfoxmcx00e1.github.io/wagu/"
 STARTED = int(time.time())
 
 core = AuthCore(os.environ.get("AUTH_PRIVATE_KEY", ""), os.path.join(DATA_DIR, "accounts.db"))
@@ -177,7 +176,6 @@ class CardView(discord.ui.View):
     def __init__(self, owner_id: int, style: str):
         super().__init__(timeout=600)
         self.owner_id, self.style = owner_id, style
-        self.add_item(discord.ui.Button(label="Website", url=SITE, style=discord.ButtonStyle.link))
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
     async def refresh(self, inter: discord.Interaction, button: discord.ui.Button):
