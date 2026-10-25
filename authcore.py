@@ -30,6 +30,8 @@ CODE_LEN = 8
 CODE_TTL = 10 * 60          # a /gen code works for 10 minutes
 VERIFY_TTL = 20 * 60        # after /gen: 20 minutes to fill in the sign up form
 SESSION_TTL = 12 * 3600     # logged in: new tickets (reconnect / host change) without the password
+REMEMBER_TTL = 180 * 24 * 3600   # 3.21.9: saved login in the phone's account.txt (survives mod updates + bot restarts)
+REMEMBER_MAX = 5                 # phones per account
 DEVICE_TTL = 24 * 3600      # 3.21.8: a /gen is remembered for the phone 24 h (game restart -> Create your account)
 DEV_RE = re.compile(r"^[0-9a-f]{32}$")
 PBKDF2_ROUNDS = 200_000
@@ -75,6 +77,8 @@ class AuthCore:
             gender TEXT NOT NULL, age INTEGER NOT NULL,
             created INTEGER NOT NULL, last_login INTEGER NOT NULL DEFAULT 0, logins INTEGER NOT NULL DEFAULT 0,
             last_server TEXT NOT NULL DEFAULT '')""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS remember(
+            tok TEXT PRIMARY KEY, user_lc TEXT NOT NULL, dev TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS pending(
             dev TEXT PRIMARY KEY, discord_id TEXT NOT NULL, discord_name TEXT NOT NULL, expires INTEGER NOT NULL)""")
         self.db.commit()
@@ -163,12 +167,45 @@ class AuthCore:
     def _hash(self, password, salt, rounds):
         return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), rounds).hex()
 
-    def _logged_in(self, a, chal, server, sid):
+    @staticmethod
+    def _tok_key(tok):
+        return hashlib.sha256(b"wagu-remember1|" + tok.encode()).hexdigest()
+
+    def _remember(self, user_lc, s):
+        """3.21.9: a login token the phone keeps in account.txt; bound to its auth_device id."""
+        if not s or not s.get("dev"):
+            return None
+        tok, dk, t = secrets.token_hex(16), self._dev_key(s["dev"]), _now()
+        self.db.execute("DELETE FROM remember WHERE user_lc=? AND dev=?", (user_lc, dk))
+        self.db.execute("INSERT INTO remember(tok,user_lc,dev,created,expires) VALUES(?,?,?,?,?)",
+                        (self._tok_key(tok), user_lc, dk, t, t + REMEMBER_TTL))
+        old = self.db.execute("SELECT tok FROM remember WHERE user_lc=? ORDER BY created DESC LIMIT -1 OFFSET ?",
+                              (user_lc, REMEMBER_MAX)).fetchall()
+        for (k,) in old:
+            self.db.execute("DELETE FROM remember WHERE tok=?", (k,))
+        self.db.execute("DELETE FROM remember WHERE expires<?", (t,))
+        self.db.commit()
+        return tok
+
+    def _remembered(self, tok, s):
+        """user_lc of a saved login, or None. Sliding: every use gives it 180 more days."""
+        if not re.fullmatch(r"[0-9a-f]{32}", tok or "") or not s or not s.get("dev"):
+            return None
+        row = self.db.execute("SELECT user_lc,dev,expires FROM remember WHERE tok=?", (self._tok_key(tok),)).fetchone()
+        if not row or row[2] < _now() or not hmac.compare_digest(row[1], self._dev_key(s["dev"])):
+            return None
+        self.db.execute("UPDATE remember SET expires=? WHERE tok=?", (_now() + REMEMBER_TTL, self._tok_key(tok)))
+        self.db.commit()
+        return row[0]
+
+    def _logged_in(self, a, chal, server, sid, s=None):
         self.db.execute("UPDATE accounts SET last_login=?, logins=logins+1, last_server=? WHERE user_lc=?",
                         (_now(), _clean(server, 39), a["user"].lower()))
         self.db.commit()
-        sess = secrets.token_hex(16)
-        self.logins[sess] = (a["user"].lower(), _now() + SESSION_TTL)
+        sess = self._remember(a["user"].lower(), s)
+        if not sess:                                     # old phone (no device id): 12 h in memory, like before
+            sess = secrets.token_hex(16)
+            self.logins[sess] = (a["user"].lower(), _now() + SESSION_TTL)
         out = {"ok": 1, "user": a["user"], "sess": sess}
         if re.fullmatch(r"[0-9a-f]{32}", chal or ""):
             out["ticket"], out["sig"] = self.sign_ticket(a["user"], a["discord_id"], chal, server)
@@ -300,7 +337,7 @@ class AuthCore:
             s["vtoken"] = None
             self._forget_dev(s, s["vdiscord"])
             a = self._account("user_lc", user.lower())
-            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid)
+            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s)
         if op == "login":
             user, pw = q.get("user", ""), q.get("pass", "")
             if not self._rate(self.fails, "login:" + sid, 10, 600) or not self._rate(self.fails, "user:" + user.lower(), 8, 600):
@@ -308,9 +345,16 @@ class AuthCore:
             a = self._account("user_lc", user.lower())
             if not a or not hmac.compare_digest(a["pass_hash"], self._hash(pw, a["salt"], a["rounds"])):
                 return {"ok": 0, "err": "Wrong username or password"}
-            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid)
+            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s)
         if op in ("ticket", "stats"):
             v = self.logins.get(q.get("sess", ""))
+            if not v or v[1] < _now():
+                u = self._remembered(q.get("sess", ""), s)      # 3.21.9: saved login (account.txt)
+                v = (u, _now() + SESSION_TTL) if u else None
+                if v and op == "ticket":   # checked against the phone id every time (not cached)
+                    self.db.execute("UPDATE accounts SET last_login=?, logins=logins+1, last_server=? WHERE user_lc=?",
+                                                    (_now(), _clean(q.get("srv", ""), 39), u))
+                    self.db.commit()
             if not v or v[1] < _now():
                 return {"ok": 0, "err": "Session expired. Log in again.", "relogin": 1}
             a = self._account("user_lc", v[0])

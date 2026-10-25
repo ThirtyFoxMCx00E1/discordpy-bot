@@ -1,4 +1,4 @@
-"""MP Multiplayer Discord bot (3.21.9, runs 24/7 on MP Railway - our own self-hosted Railway).
+"""MP Multiplayer Discord bot (3.22, runs 24/7 on MP Railway - our own self-hosted Railway).
 
   /gen CODE  - only in #verification: links the code shown in the game to your Discord account
   /stats     - your game account card (only you see it)
@@ -29,7 +29,7 @@ import paho.mqtt.client as mqtt
 
 from authcore import AuthCore, TOPIC_REQ, TOPIC_RES
 
-VERSION = "3.21.9"
+VERSION = "3.22"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mpbot")
 
