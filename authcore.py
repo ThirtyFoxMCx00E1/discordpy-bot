@@ -8,6 +8,7 @@ PBKDF2-HMAC-SHA256 (200 000 rounds, random salt) and never leave this process.
 A good login / sign up returns a ticket "WAGU1|user|discord|challenge|server|time" signed with our
 key (ECDSA P-256, raw r||s). The game server checks it with the public key built into the mod.
 """
+import base64
 import hashlib
 import hmac
 import os
@@ -85,6 +86,8 @@ class AuthCore:
         self.sessions = {}      # sid -> {key, broker, seen, code, vtoken, vdiscord, vname, vexp}
         self.codes = {}         # code -> (sid, expires)
         self.logins = {}        # sess token -> (user_lc, expires)
+        self.avatar_q = []      # 3.24: (sid, discord_id, discord_name) for main.py to fetch
+        self.avatar_cache = {}  # 3.24: discord_id -> (png bytes, expires)
         self.fails = {}         # key -> [timestamps]
         self.gen_rate = {}      # discord id -> [timestamps]
 
@@ -109,6 +112,33 @@ class AuthCore:
         s["broker"] = broker
         s["seen"] = _now()
         return s
+
+    # ---------------------------------------------------------------- 3.24: Discord avatar
+    AVATAR_CHUNK = 280          # every value is cut at 300 characters by seal()
+
+    def avatar_answer(self, png, dname):
+        b64 = base64.b64encode(png).decode()
+        parts = [b64[i:i + self.AVATAR_CHUNK] for i in range(0, len(b64), self.AVATAR_CHUNK)]
+        out = {"op": "avatar", "rid": "a", "ok": 1, "n": len(parts), "dname": _clean(dname, 40)}
+        for i, p in enumerate(parts):
+            out[f"p{i}"] = p
+        return out
+
+    def take_avatar_jobs(self):
+        with self.lock:
+            jobs, self.avatar_q = self.avatar_q, []
+        return jobs
+
+    def avatar_done(self, sid, discord_id, dname, png):
+        """main.py got the picture (png=None: failed). -> encrypted push for that phone, or None."""
+        with self.lock:
+            s = self.sessions.get(sid)
+            if png:
+                self.avatar_cache[str(discord_id)] = (png, _now() + 3600)
+            if not s:
+                return None
+            ans = self.avatar_answer(png, dname) if png else {"op": "avatar", "rid": "a", "ok": 0, "err": "no avatar"}
+            return self.seal(s, ans)
 
     def seal(self, s, fields):
         plain = "\n".join(f"{k}={_line(v, 300)}" for k, v in fields.items()).encode()
@@ -291,7 +321,7 @@ class AuthCore:
         dev = q.get("dev", "")
         if DEV_RE.match(dev):
             s["dev"] = dev
-        if op not in ("hello", "gen", "stats"):
+        if op not in ("hello", "gen", "stats", "avatar"):
             s["vpush"] = None                            # the phone moved on (sign up / login): stop re-sending
         if op in ("hello", "gen"):
             p = self._pending_verified(s) or self._restore_dev(s)
@@ -346,7 +376,7 @@ class AuthCore:
             if not a or not hmac.compare_digest(a["pass_hash"], self._hash(pw, a["salt"], a["rounds"])):
                 return {"ok": 0, "err": "Wrong username or password"}
             return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s)
-        if op in ("ticket", "stats"):
+        if op in ("ticket", "stats", "avatar"):
             v = self.logins.get(q.get("sess", ""))
             if not v or v[1] < _now():
                 u = self._remembered(q.get("sess", ""), s)      # 3.21.9: saved login (account.txt)
@@ -365,6 +395,12 @@ class AuthCore:
                     return {"ok": 0, "err": "bad challenge"}
                 t, sig = self.sign_ticket(a["user"], a["discord_id"], q["chal"], q.get("srv", ""))
                 return {"ok": 1, "user": a["user"], "ticket": t, "sig": sig}
+            if op == "avatar":   # 3.24: launcher profile picture; main.py fetches it from Discord, then pushes it
+                hit = self.avatar_cache.get(str(a["discord_id"]))
+                if hit and hit[1] > _now():
+                    return self.avatar_answer(hit[0], a["discord_name"])
+                self.avatar_q.append((sid, str(a["discord_id"]), a["discord_name"]))
+                return {"ok": 1, "wait": 1}
             return {"ok": 1, "user": a["user"], "discord": a["discord_name"], "gender": a["gender"], "age": a["age"],
                     "created": a["created"], "logins": a["logins"], "last": a["last_login"], "server": a["last_server"]}
         return {"ok": 0, "err": "unknown request"}

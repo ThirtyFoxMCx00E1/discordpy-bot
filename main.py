@@ -29,7 +29,7 @@ import paho.mqtt.client as mqtt
 
 from authcore import AuthCore, TOPIC_REQ, TOPIC_RES
 
-VERSION = "3.22"
+VERSION = "3.24"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mpbot")
 
@@ -257,6 +257,8 @@ async def on_ready():
         client._beacon = asyncio.create_task(beacon())
     if not getattr(client, "_repush", None):
         client._repush = asyncio.create_task(repush_loop())
+    if not getattr(client, "_avatars", None):
+        client._avatars = asyncio.create_task(avatar_loop())
 
 
 @client.event
@@ -274,6 +276,39 @@ async def repush_loop():
         except Exception as e:
             log.warning("repush: %s", e)
         await asyncio.sleep(3)
+
+
+async def fetch_avatar_png(discord_id):
+    """3.24: the Discord profile picture as a 64 px PNG (animated ones: the first frame)."""
+    user = client.get_user(int(discord_id)) or await client.fetch_user(int(discord_id))
+    asset = user.display_avatar
+    try:
+        asset = asset.replace(size=64, static_format="png", format="png")
+    except Exception:
+        try:
+            asset = asset.with_static_format("png").with_size(64)
+        except Exception:
+            pass                              # default avatars: already a small PNG
+    data = await asset.read()
+    return data if data[:4] == b"\x89PNG" and len(data) < 96 * 1024 else None
+
+
+async def avatar_loop():
+    """3.24: the launcher asks for its profile picture; fetch it from Discord and push it to the phone."""
+    while True:
+        try:
+            for sid, did, dname in await asyncio.to_thread(core.take_avatar_jobs):
+                png = None
+                try:
+                    png = await fetch_avatar_png(did)
+                except Exception as e:
+                    log.warning("avatar %s: %s", did, e)
+                frame = await asyncio.to_thread(core.avatar_done, sid, did, dname, png)
+                if frame:
+                    bridge.push(sid, frame)
+        except Exception as e:
+            log.warning("avatar loop: %s", e)
+        await asyncio.sleep(1)
 
 
 async def beacon():
