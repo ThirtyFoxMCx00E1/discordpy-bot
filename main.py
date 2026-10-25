@@ -257,12 +257,25 @@ async def on_ready():
         log.warning("global commands: %s", e)
     if not getattr(client, "_beacon", None):
         client._beacon = asyncio.create_task(beacon())
+    if not getattr(client, "_repush", None):
+        client._repush = asyncio.create_task(repush_loop())
 
 
 @client.event
 async def on_guild_join(g):
     log.info("Joined %s", g)
     await _sync_guild(g)
+
+
+async def repush_loop():
+    """3.21.7: keeps sending "verified" to a phone that was in the background during /gen."""
+    while True:
+        try:
+            for sid, frame in await asyncio.to_thread(core.repush):
+                bridge.push(sid, frame)
+        except Exception as e:
+            log.warning("repush: %s", e)
+        await asyncio.sleep(3)
 
 
 async def beacon():

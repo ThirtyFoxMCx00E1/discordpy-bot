@@ -185,12 +185,38 @@ class AuthCore:
                 return None
             ans = self._handle(s, req)
             ans["rid"] = req.get("rid", "")
-            ans["op"] = req.get("op", "")
+            ans.setdefault("op", req.get("op", ""))
             return s["sid"], self.seal(s, ans)
+
+    def _pending_verified(self, s):
+        """3.21.7: the "verified" push from /gen, while the phone hasn't used it yet."""
+        p = s.get("vpush")
+        if p and s.get("vtoken") and s.get("vpush_until", 0) > _now():
+            return dict(p)
+        return None
+
+    def repush(self):
+        """3.21.7: re-send "verified" every few seconds. Android pauses the game while you are in
+        Discord, so its MQTT link is down at the moment of /gen and the first push is lost."""
+        out = []
+        with self.lock:
+            for sid, s in list(self.sessions.items()):
+                p = self._pending_verified(s)
+                if p:
+                    out.append((sid, self.seal(s, p)))
+                elif s.get("vpush"):
+                    s["vpush"] = None
+        return out
 
     def _handle(self, s, q):
         op = q.get("op")
         sid = s["sid"]
+        if op not in ("hello", "gen", "stats"):
+            s["vpush"] = None                            # the phone moved on (sign up / login): stop re-sending
+        if op in ("hello", "gen"):
+            p = self._pending_verified(s)
+            if p:
+                return p                                 # back from Discord: tell it right away
         if op == "hello":
             return {"ok": 1}
         if op == "gen":
@@ -277,6 +303,7 @@ class AuthCore:
             s["vexp"] = _now() + VERIFY_TTL
             a = self._account("discord_id", str(discord_id))
             push = {"op": "verified", "vtoken": s["vtoken"], "dname": s["vname"], "has": 1 if a else 0, "user": a["user"] if a else ""}
+            s["vpush"], s["vpush_until"] = push, _now() + 10 * 60
             if a:
                 text = f"Verified. You already have the game account **{a['user']}**: log in with it in the game."
             else:
