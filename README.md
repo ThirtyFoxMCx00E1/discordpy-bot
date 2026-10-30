@@ -15,7 +15,7 @@ server with "Authentication system" on.
 2. In the Discord server ([discord.gg/tbsDknk34y](https://discord.gg/tbsDknk34y)) the player types
    `/gen CODE` in **#verification** (the command works only there; the answer is only visible to them).
 3. The game shows Sign up: user, password, gender, age -> **Create**. Next time: Login only.
-4. `/stats` or `/char` (Discord, only visible to you, card with Refresh / Switch view buttons) or `/stats` / `/char` in the game: your account.
+4. `/statsdc` or `/chardc` (Discord, only visible to you, card with Refresh / Switch view buttons) or `/stats` / `/char` in the game: your account.
 
 Accounts are stored only here (SQLite, password hashed with PBKDF2-SHA256 + salt). The game and the
 bot talk end-to-end encrypted (ECDH P-256 + AES-256-GCM) over public MQTT brokers; the bot signs a
@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/railwa
 
 It asks for `DISCORD_TOKEN` and `AUTH_PRIVATE_KEY` (hidden input, stored in
 `/etc/mp-railway/discordpy-bot.env`, mode 600, never in git), deploys and prints
-`ONLINE - /gen, /stats, /char are in your Discord server`. Termius console: **r) MP Railway**.
+`ONLINE - /gen, /statsdc, /chardc are in your Discord server`. Termius console: **r) MP Railway**.
 
 ```
 sudo mp-railway status        online? commit? which servers have the commands

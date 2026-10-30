@@ -1,8 +1,8 @@
 """MP Multiplayer Discord bot (3.22, runs 24/7 on MP Railway - our own self-hosted Railway).
 
   /gen CODE  - only in #verification: links the code shown in the game to your Discord account
-  /stats     - your game account card (only you see it)
-  /char      - the same card, character style (only you see it)
+  /statsdc   - your game account card (only you see it)   (3.34: renamed from /stats)
+  /chardc    - the same card, character style (only you see it)   (3.34: renamed from /char)
 
 Settings are environment variables, never put them in the code or in git:
   DISCORD_TOKEN     the bot token (Discord Developer Portal -> Bot -> Reset Token)
@@ -150,7 +150,7 @@ def _ago(t):
 
 
 def account_card(user: discord.abc.User, a: dict, style: str) -> discord.Embed:
-    """The account UI: one card, two looks (/stats = account, /char = character)."""
+    """The account UI: one card, two looks (/statsdc = account, /chardc = character)."""
     if style == "char":
         e = discord.Embed(title=a["user"], description=f"**MP Multiplayer character**\nLinked to {user.mention}", color=0x111111)
         e.add_field(name="Gender", value=a["gender"])
@@ -180,7 +180,7 @@ class CardView(discord.ui.View):
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
     async def refresh(self, inter: discord.Interaction, button: discord.ui.Button):
         if inter.user.id != self.owner_id:
-            await inter.response.send_message("Use /stats yourself to see your own account.", ephemeral=True)
+            await inter.response.send_message("Use /statsdc yourself to see your own account.", ephemeral=True)
             return
         a = await asyncio.to_thread(core.account_by_discord, inter.user.id)
         if not a:
@@ -191,7 +191,7 @@ class CardView(discord.ui.View):
     @discord.ui.button(label="Switch view", style=discord.ButtonStyle.primary)
     async def switch(self, inter: discord.Interaction, button: discord.ui.Button):
         if inter.user.id != self.owner_id:
-            await inter.response.send_message("Use /stats yourself to see your own account.", ephemeral=True)
+            await inter.response.send_message("Use /statsdc yourself to see your own account.", ephemeral=True)
             return
         self.style = "stats" if self.style == "char" else "char"
         a = await asyncio.to_thread(core.account_by_discord, inter.user.id)
@@ -213,12 +213,12 @@ async def show_card(inter: discord.Interaction, style: str):
     await inter.response.send_message(embed=account_card(inter.user, a, style), view=CardView(inter.user.id, style), ephemeral=True)
 
 
-@tree.command(name="stats", description="Your MP Multiplayer account (only you see it)")
+@tree.command(name="statsdc", description="Your MP Multiplayer account (only you see it)")
 async def stats_cmd(inter: discord.Interaction):
     await show_card(inter, "stats")
 
 
-@tree.command(name="char", description="Your MP Multiplayer character card (only you see it)")
+@tree.command(name="chardc", description="Your MP Multiplayer character card (only you see it)")
 async def char_cmd(inter: discord.Interaction):
     await show_card(inter, "char")
 
@@ -318,7 +318,7 @@ async def beacon():
             doc = {
                 "app": APP, "online": client.is_ready(), "ver": VERSION, "commit": COMMIT, "host": HOST_LABEL,
                 "bot": str(client.user) if client.user else "", "guilds": len(client.guilds),
-                "cmds": synced["cmds"] or ["/gen", "/stats", "/char"], "login": core.ready,
+                "cmds": synced["cmds"] or ["/gen", "/statsdc", "/chardc"], "login": core.ready,
                 "accounts": await asyncio.to_thread(core.account_count), "brokers": bridge.connected(),
                 "ping": round(client.latency * 1000) if client.latency == client.latency else -1,
                 "started": STARTED, "ts": int(time.time()), "py": platform.python_version(),
